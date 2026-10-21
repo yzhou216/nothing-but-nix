@@ -24,6 +24,10 @@ inputs:
     description: 'Grant user ownership of /nix directory (default: false). Useful for Nix installers that require user-writable /nix.'
     required: false
     default: 'false'
+  filesystem:
+    description: 'Filesystem for the /nix volume: btrfs (default) or bcachefs (experimental, built from the upstream DKMS module, falls back to btrfs when its requirements are not met)'
+    required: false
+    default: 'btrfs'
 runs:
   using: composite
   steps:
@@ -103,6 +107,148 @@ runs:
         esac
 
         echo "level=${protocol_level}" >> $GITHUB_OUTPUT
+    - name: The Filesystem
+      id: set-filesystem
+      if: steps.environment-check.outputs.is_supported == 'true'
+      shell: bash
+      env:
+        input_filesystem: ${{ inputs.filesystem }}
+      run: |
+        # Convert to lowercase for case-insensitive comparison
+        input_filesystem="$(tr '[:upper:]' '[:lower:]' <<< "${input_filesystem}")"
+
+        bcachefs_apt_url="https://apt.bcachefs.org"
+        # Primary key of the repository, the website lists its signing subkey (EA483B99...) instead
+        bcachefs_apt_fingerprint="64DA57BD19CDE340D3B2DA48F7578FFBB284AA61"
+        bcachefs_min_kernel="6.16"
+        bcachefs_apt_source="/etc/apt/sources.list.d/apt.bcachefs.org.sources"
+        bcachefs_apt_keyring="/etc/apt/keyrings/apt.bcachefs.org.asc"
+        bcachefs_dkms_overrides=(
+          /etc/dkms/no-autoinstall-errors
+          /etc/dkms/framework.conf.d/zz-nothing-but-nix.conf
+        )
+
+        function bcachefs_unavailable() {
+          echo "::warning::bcachefs is unavailable on this runner, falling back to btrfs: $*"
+        }
+
+        function apt_install() {
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            -o DPkg::Lock::Timeout=60 "$@"
+        }
+
+        # bcachefs is no longer part of the mainline kernel, so it is always built from the
+        # upstream DKMS module and installed with the matching tools from apt.bcachefs.org
+        function bcachefs_dkms_install() {
+          kernel="$(uname -r)"
+          arch="$(dpkg --print-architecture)"
+          codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME}}")"
+          repo="${bcachefs_apt_url}/${codename}"
+
+          # The DKMS module only supports recent kernels
+          if dpkg --compare-versions "${kernel%%-*}" lt "${bcachefs_min_kernel}"; then
+            bcachefs_unavailable "kernel ${kernel} is older than ${bcachefs_min_kernel}, the minimum for the DKMS module"
+            return 1
+          fi
+
+          # Upstream publishes packages per Ubuntu release and architecture
+          if ! curl --fail --silent --location --output /dev/null \
+              "${repo}/dists/bcachefs-tools-release/main/binary-${arch}/Release"; then
+            bcachefs_unavailable "${bcachefs_apt_url} has no packages for ${codename} on ${arch}"
+            return 1
+          fi
+
+          # Only trust the upstream signing key if it is exactly the pinned primary key
+          key_file="$(mktemp)"
+          if ! curl --fail --silent --location --output "${key_file}" "${bcachefs_apt_url}/apt.bcachefs.org.asc"; then
+            bcachefs_unavailable "could not download the apt.bcachefs.org signing key"
+            return 1
+          fi
+          key_fingerprints="$(gpg --show-keys --with-colons "${key_file}" \
+            | awk -F: '/^pub:/ { primary = 1 } /^sub:/ { primary = 0 } /^fpr:/ && primary { print $10; primary = 0 }')"
+          if [[ "${key_fingerprints}" != "${bcachefs_apt_fingerprint}" ]]; then
+            bcachefs_unavailable "the apt.bcachefs.org signing key does not match the pinned fingerprint"
+            return 1
+          fi
+          sudo install -D -m 0644 "${key_file}" "${bcachefs_apt_keyring}"
+          printf '%s\n' \
+            "Types: deb" \
+            "URIs: ${repo}/" \
+            "Suites: bcachefs-tools-release" \
+            "Components: main" \
+            "Architectures: ${arch}" \
+            "Signed-By: ${bcachefs_apt_keyring}" \
+            | sudo tee "${bcachefs_apt_source}" > /dev/null
+          if ! sudo apt-get update -qq; then
+            bcachefs_unavailable "apt update failed"
+            return 1
+          fi
+
+          # Headers for the running kernel must be present first, otherwise DKMS skips the build
+          if ! apt_install "linux-headers-${kernel}"; then
+            bcachefs_unavailable "kernel headers for ${kernel} could not be installed"
+            return 1
+          fi
+
+          # Keep dpkg consistent if the module fails to build, the result is checked below.  Ubuntu
+          # enables autoinstall_all_kernels, so limit the build to the running kernel, otherwise the
+          # unused generic headers that the DKMS package depends on would double the build time
+          sudo install -d /etc/dkms/framework.conf.d
+          sudo touch /etc/dkms/no-autoinstall-errors
+          echo 'autoinstall_all_kernels=""' | sudo tee /etc/dkms/framework.conf.d/zz-nothing-but-nix.conf > /dev/null
+          if ! apt_install bcachefs-tools bcachefs-kernel-dkms; then
+            bcachefs_unavailable "bcachefs-tools and bcachefs-kernel-dkms could not be installed"
+            return 1
+          fi
+
+          dkms_version="$(dpkg-query --show --showformat='${Version}' bcachefs-kernel-dkms | sed 's/^[0-9]*://')"
+          dkms_status="$(sudo dkms status -m bcachefs -v "${dkms_version}" -k "${kernel}")"
+          if ! grep -q ': installed' <<< "${dkms_status}"; then
+            sudo tail -n 40 "/var/lib/dkms/bcachefs/${dkms_version}/build/make.log" 2>/dev/null || true
+            bcachefs_unavailable "the DKMS module ${dkms_version} did not build for kernel ${kernel}"
+            return 1
+          fi
+
+          # Unload any in-tree module so that the DKMS build is the one in use
+          sudo modprobe --remove bcachefs 2>/dev/null || true
+          if ! sudo modprobe bcachefs || ! grep -qw bcachefs /proc/filesystems; then
+            bcachefs_unavailable "the DKMS module ${dkms_version} could not be loaded"
+            return 1
+          fi
+          loaded_version="$(cat /sys/module/bcachefs/version 2>/dev/null || true)"
+          if [[ "${loaded_version}" != "${dkms_version}" ]]; then
+            bcachefs_unavailable "the loaded bcachefs module (${loaded_version:-unknown}) is not the DKMS build ${dkms_version}"
+            return 1
+          fi
+          echo "Loaded bcachefs DKMS module ${dkms_version} for kernel ${kernel}"
+        }
+
+        function bcachefs_dkms_cleanup() {
+          sudo rm -f "${bcachefs_dkms_overrides[@]}"
+          if [[ -e "${bcachefs_apt_source}" ]]; then
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq bcachefs-tools bcachefs-kernel-dkms || true
+            sudo rm -f "${bcachefs_apt_source}" "${bcachefs_apt_keyring}"
+          fi
+        }
+
+        fs_type="btrfs"
+        case "$input_filesystem" in
+          "btrfs")
+            echo "Filesystem: btrfs";;
+          "bcachefs")
+            if bcachefs_dkms_install; then
+              echo "Filesystem: bcachefs (experimental)"
+              fs_type="bcachefs"
+              # The apt source is only needed to install the packages
+              sudo rm -f "${bcachefs_dkms_overrides[@]}" "${bcachefs_apt_source}" "${bcachefs_apt_keyring}"
+            else
+              bcachefs_dkms_cleanup
+            fi;;
+          *)
+            echo "::warning::Unknown filesystem '${input_filesystem}', falling back to btrfs";;
+        esac
+
+        echo "type=${fs_type}" >> $GITHUB_OUTPUT
     - name: The Setup
       if: steps.environment-check.outputs.is_supported == 'true' && steps.set-hatchet-protocol.outputs.level > 1
       shell: bash
@@ -133,6 +279,7 @@ runs:
         sudo mv rmz /usr/bin/rmz
         rmz --version
     - name: The Volume
+      id: create-volume
       if: steps.environment-check.outputs.is_supported == 'true'
       shell: bash
       run: |
@@ -161,14 +308,33 @@ runs:
           exit 1
         fi
 
-        # Create filesystem
-        sudo mkfs.btrfs -L nix -d raid0 -m raid0 --nodiscard "${loop_dev}"
-        sudo btrfs device scan
-        sudo btrfs filesystem show
+        function create_btrfs() {
+          sudo mkfs.btrfs -L nix -d raid0 -m raid0 --nodiscard "${loop_dev}"
+          sudo btrfs device scan
+          sudo btrfs filesystem show
+          sudo mount LABEL=nix /nix -o noatime,nobarrier,nodiscard,compress=zstd:1,space_cache=v2,commit=120
+        }
 
-        # Mount filesystem
+        function create_bcachefs() {
+          sudo bcachefs format --force -L nix --compression=zstd:1 "${loop_dev}" &&
+            sudo mount -t bcachefs "${loop_dev}" /nix -o noatime
+        }
+
+        # Create and mount filesystem
+        fs_type="${{ steps.set-filesystem.outputs.type }}"
         sudo mkdir -p /nix
-        sudo mount LABEL=nix /nix -o noatime,nobarrier,nodiscard,compress=zstd:1,space_cache=v2,commit=120
+        if [[ "${fs_type}" == "bcachefs" ]] && ! create_bcachefs; then
+          echo "::warning::Failed to create a bcachefs volume, falling back to btrfs"
+          sudo wipefs --all "${loop_dev}" || true
+          # Remove the bcachefs module and packages, which are no longer needed
+          sudo modprobe --remove bcachefs 2>/dev/null || true
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq bcachefs-tools bcachefs-kernel-dkms || true
+          fs_type="btrfs"
+        fi
+        if [[ "${fs_type}" == "btrfs" ]]; then
+          create_btrfs
+        fi
+        echo "filesystem=${fs_type}" >> $GITHUB_OUTPUT
         sudo df -h
 
         # Create /nix/build for Nix's build-dir setting
@@ -205,6 +371,7 @@ runs:
         protocol_level="${{ steps.set-hatchet-protocol.outputs.level }}"
         expansion_dir="${HOME}/.expansion"
         root_safe_haven="${{ inputs.root-safe-haven }}"
+        fs_type="${{ steps.create-volume.outputs.filesystem }}"
 
         function add_expansion_disk() {
           # Check for additional free space after purging
@@ -223,12 +390,21 @@ runs:
               sudo losetup ${loop_dev} "/disk${loop_num}.img"
 
               # Add the new device to the pool
-              sudo btrfs device add --nodiscard ${loop_dev} /nix
+              if [[ "${fs_type}" == "bcachefs" ]]; then
+                sudo bcachefs device add /nix ${loop_dev}
+              else
+                sudo btrfs device add --nodiscard ${loop_dev} /nix
+              fi
               echo "Added expansion disk "/disk${loop_num}.img" (${loop_dev}, ${disk_size}MB) to /nix pool" > $expansion_dir/expansion_done
 
               # Balance the filesystem to use the new space
-              sudo btrfs balance start -dusage=50 /nix
-              sudo btrfs filesystem show
+              # bcachefs spreads new writes across all member devices, so it needs no balance
+              if [[ "${fs_type}" == "bcachefs" ]]; then
+                sudo bcachefs fs usage -h /nix
+              else
+                sudo btrfs balance start -dusage=50 /nix
+                sudo btrfs filesystem show
+              fi
             fi
           fi
         }
@@ -421,7 +597,12 @@ runs:
           sudo du -csh "${TMPDIR}" 2>/dev/null || echo "TMPDIR not found or empty"
           echo "Space used by disk images:"
           sudo df -h
-          echo "Check which device(s) btrfs is using:"
-          sudo btrfs filesystem show /nix
-          echo "See actual allocation per device:"
-          sudo btrfs device stats /nix
+          if [[ "$(findmnt --noheadings --output FSTYPE /nix)" == "bcachefs" ]]; then
+            echo "Check which device(s) and how much space bcachefs is using:"
+            sudo bcachefs fs usage -h /nix
+          else
+            echo "Check which device(s) btrfs is using:"
+            sudo btrfs filesystem show /nix
+            echo "See actual allocation per device:"
+            sudo btrfs device stats /nix
+          fi

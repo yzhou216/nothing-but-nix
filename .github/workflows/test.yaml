@@ -92,4 +92,49 @@ jobs:
           nix --version
           echo "Hello Nix" | nix run "nixpkgs#neo-cowsay"
           # Build a package to ensure the Nix store is functional
+          nix build "nixpkgs#hello"
+  bcachefs:
+    name: bcachefs (${{ matrix.hatchet-protocol }}) on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
+        hatchet-protocol: [holster, cleave]
+        # bcachefs needs the upstream DKMS module: 22.04 has a kernel older than 6.16 and
+        # apt.bcachefs.org has no 24.04 packages, so both are expected to fall back to btrfs
+        include:
+          - os: ubuntu-22.04
+            expect: btrfs
+          - os: ubuntu-24.04
+            expect: btrfs
+          - os: ubuntu-26.04
+            expect: bcachefs
+      fail-fast: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          path: ./.github/actions/this
+      - name: Purge
+        uses: ./.github/actions/this
+        with:
+          hatchet-protocol: ${{ matrix.hatchet-protocol }}
+          filesystem: bcachefs
+          witness-carnage: true
+          nix-permission-edict: true
+      - name: Report filesystem
+        run: |
+          fstype="$(findmnt --noheadings --output FSTYPE /nix)"
+          echo "Filesystem backing /nix: ${fstype} (expected ${{ matrix.expect }})"
+          dkms status || true
+          df -h /nix
+          test "${fstype}" = "${{ matrix.expect }}"
+      - uses: nixbuild/nix-quick-install-action@v35
+      - name: Nix
+        run: |
+          nix --version
+          # Build a package to ensure the Nix store is functional
           nix build "nixpkgs#hello"          

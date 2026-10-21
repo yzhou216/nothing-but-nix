@@ -168,6 +168,25 @@ These safe havens define how much space (in MB) will be mercifully spared during
 
 Increase these values if you need more breathing room on your filesystems, or decrease them to show no mercy! 😈
 
+### Choose Your Filesystem (Experimental)
+
+By default `/nix` is a BTRFS volume. You can opt in to bcachefs with the `filesystem` input:
+
+```yaml
+- uses: wimpysworld/nothing-but-nix@main
+  with:
+    filesystem: 'bcachefs'  # Options: btrfs (default), bcachefs
+```
+
+bcachefs requires Ubuntu 26.04 or newer. Otherwise the action emits a warning and **falls back to BTRFS**, so your workflow keeps running. To see which filesystem is in use, run `findmnt --noheadings --output FSTYPE /nix`.
+
+Things to be aware of:
+
+- Installing the packages and compiling the module happens before `/nix` is created, which added about two minutes on the 4 vCPU `ubuntu-26.04` runners (x64 and arm64)
+- The packages are installed as root from the third-party [apt.bcachefs.org](https://apt.bcachefs.org) repository, which the action adds to apt for the install and removes again
+
+When bcachefs is used, the expansion disk is added with `bcachefs device add` and no balance step is needed.
+
 ### Grant User Ownership of /nix (Nix Permission Edict) 🧑‍⚖️
 
 Some Nix installers or configurations expect the `/nix` directory to be writable by the current user. By default, `/nix` is owned by root. If you need user ownership (e.g., for certain Nix installer scripts that don't use `sudo` for all operations within `/nix`), you can enable the `nix-permission-edict`:

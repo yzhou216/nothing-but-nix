@@ -14,7 +14,7 @@ The action is production-ready and intended for use in GitHub Actions workflows 
 
 - **Platform**: GitHub Actions composite action (Ubuntu runners only; macOS and Windows runners gracefully skip)
 - **Shell**: Bash (embedded in `action.yml`)
-- **Filesystem**: BTRFS with RAID0, zstd compression, loop devices
+- **Filesystem**: BTRFS with RAID0, zstd compression, loop devices (optionally bcachefs, built from the upstream DKMS module)
 - **Tools**: `rmz` (Fast Unix Commands), Docker CLI, APT, snap
 - **Dependencies**: Standard Ubuntu utilities (`df`, `losetup`, `fallocate`, `mkfs.btrfs`)
 
@@ -48,11 +48,12 @@ The action follows a specific execution order:
 
 1. **The Checks**: Validate environment (Ubuntu on Linux, macOS/Windows graceful skip, GitHub Actions, no pre-existing `/nix`)
 2. **The Hatchet Protocol**: Set purge level (0-3)
-3. **The Setup**: Download and install `rmz` binary (protocol level ≥2)
-4. **The Volume**: Create initial BTRFS volume from `/mnt` free space
-5. **The Local**: Purge `/usr/local` early (protocol level ≥2)
-6. **The Purge**: Execute background expansion script
-7. **The Post**: Report final disk usage and expansion status
+3. **The Filesystem**: Resolve the `filesystem` input (`btrfs`, or experimental `bcachefs`: install the upstream DKMS module and tools, falling back to `btrfs` when the requirements are not met)
+4. **The Setup**: Download and install `rmz` binary (protocol level ≥2)
+5. **The Volume**: Create initial volume from `/mnt` free space (BTRFS, or bcachefs when selected and available)
+6. **The Local**: Purge `/usr/local` early (protocol level ≥2)
+7. **The Purge**: Execute background expansion script
+8. **The Post**: Report final disk usage and expansion status
 
 ### Naming Conventions
 
@@ -82,6 +83,7 @@ gh run list --workflow=test.yaml --limit 5
 The `test.yaml` workflow validates:
 - All four hatchet protocols (holster, carve, cleave, rampage)
 - Both Ubuntu LTS versions (22.04, 24.04)
+- bcachefs on 22.04, 24.04 and 26.04, asserting the expected filesystem (bcachefs on 26.04, btrfs fallback elsewhere)
 - Three popular Nix installers:
   - DeterminateSystems/determinate-nix-action
   - nixbuild/nix-quick-install-action (requires `nix-permission-edict: true`)
@@ -98,14 +100,18 @@ ls -ltr ${HOME}/.expansion/*_done
 # View disk images
 du -h /mnt/disk*.img /disk*.img 2>/dev/null
 
-# Check BTRFS pool devices
-sudo btrfs filesystem show /nix
-
-# View device statistics
-sudo btrfs device stats /nix
-
 # Check /nix volume size
 df -h /nix
+
+# Check which filesystem backs /nix (btrfs or bcachefs), then run only the matching commands below
+findmnt --noheadings --output FSTYPE /nix
+
+# btrfs only: check pool devices and view device statistics
+sudo btrfs filesystem show /nix
+sudo btrfs device stats /nix
+
+# bcachefs only: view pool devices and usage
+sudo bcachefs fs usage -h /nix
 ```
 
 ## Development Guidelines
@@ -146,6 +152,7 @@ Expansion disk is only created if `free_space > (root_safe_haven + 2048)`.
 - **No secret handling**: The action does not interact with secrets or credentials
 - **Destructive operations**: Purging is irreversible; protocol selection is critical
 - **Loop device management**: Uses `losetup --find` to avoid conflicts
+- **Third-party apt repository**: `filesystem: bcachefs` adds apt.bcachefs.org for the install, removes it again and installs its packages as root. The primary signing key fingerprint is pinned in `action.yml` and the key file must contain exactly that key. Update the pin if upstream rotates the key
 
 ## Architecture Notes
 
@@ -197,6 +204,8 @@ Before submitting changes:
 - **Pre-Nix only**: Must run before Nix installation (checks for `/nix` directory)
 - **GitHub Actions only**: Requires `$GITHUB_ACTIONS` environment variable
 - **BTRFS required**: Ubuntu runners include BTRFS tools by default
+- **bcachefs is DKMS only**: It needs kernel 6.16 or newer, kernel headers for the running kernel and upstream packages for the Ubuntu release and architecture (none for 22.04 or 24.04 at the time of writing). Otherwise the action falls back to BTRFS
+- **bcachefs CONFIG_RUST warning**: `bcachefs-tools` warns that the kernel lacks `CONFIG_RUST`. This is harmless, because the DKMS module vendors its own Rust stack and builds without it. If upstream stops building the C-only module, the build may need `rustc`, `rust-src` and `bindgen` installed first (untested)
 - **Loop device availability**: Assumes sufficient loop devices available via `losetup --find`
 
 ## Resources
