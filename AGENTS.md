@@ -186,7 +186,7 @@ Before submitting changes:
 1. Test all four hatchet protocols via `test.yaml`
 2. Verify both Ubuntu LTS versions (22.04, 24.04)
 3. Confirm README.md reflects any new inputs or behaviour changes
-4. Use British English in documentation
+4. Use [Oxford spelling](https://en.wikipedia.org/wiki/Oxford_spelling) in documentation
 5. Follow existing naming conventions for steps ("The X" pattern)
 
 ## Constraints
